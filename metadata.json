@@ -1,0 +1,5 @@
+{
+  "name": "AI Video Short Generator",
+  "description": "An application to generate short videos from text descriptions, featuring character creation, scene decomposition, and automated YouTube metadata generation.",
+  "requestFramePermissions": []
+}
