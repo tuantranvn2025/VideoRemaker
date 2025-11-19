@@ -11,6 +11,8 @@ import ProgressBar from './components/ProgressBar';
 import NotificationContainer, { Notification } from './components/Notification';
 import { appLogger } from './utils/logger';
 import LogPanel from './components/LogPanel';
+import { mergeBuffers, showSaveDialog, saveBase64File, openFlowAuth } from './services/electronApi';
+import { validateApiKey } from './services/geminiService';
 
 const LOCAL_STORAGE_KEY = 'aiVideoProject';
 const ELEVENLABS_API_KEY_STORAGE = 'elevenLabsApiKey';
@@ -117,6 +119,8 @@ const App: React.FC = () => {
   const [isPreviewingAllScenes, setIsPreviewingAllScenes] = useState<boolean>(false);
   const [regeneratingPromptId, setRegeneratingPromptId] = useState<string | null>(null);
   const [isCombining, setIsCombining] = useState<boolean>(false);
+  const [selectedSceneIds, setSelectedSceneIds] = useState<Set<string>>(new Set());
+  const [mergeLogs, setMergeLogs] = useState<string>('');
   const [activeGenerations, setActiveGenerations] = useState<Set<string>>(new Set());
   const [isGeneratingTestVideo, setIsGeneratingTestVideo] = useState(false);
   const [testVideoOperation, setTestVideoOperation] = useState<any | null>(null);
@@ -127,8 +131,17 @@ const App: React.FC = () => {
   const [isOpeningKeySelector, setIsOpeningKeySelector] = useState(false);
   const [isLoading, setIsLoading] = useState<boolean>(true);
   const [apiKeySelected, setApiKeySelected] = useState<boolean>(false);
+  const [geminiApiKey, setGeminiApiKey] = useState<string>(() => {
+    try { return localStorage.getItem('GEMINI_API_KEY') || ''; } catch { return ''; }
+  });
+  const [isValidatingKey, setIsValidatingKey] = useState(false);
   const [elevenLabsApiKey, setElevenLabsApiKey] = useState<string>('');
   const [elevenLabsVoices, setElevenLabsVoices] = useState<ElevenLabsVoice[]>([]);
+  const [veoSessionKey, setVeoSessionKey] = useState<string>(() => { try { return localStorage.getItem('VEO_FLOW_SESSION') || ''; } catch { return ''; } });
+  const [veoApiBase, setVeoApiBase] = useState<string>(() => { try { return localStorage.getItem('VEO_FLOW_BASE') || ''; } catch { return ''; } });
+  const [veoHeaderName, setVeoHeaderName] = useState<string>(() => { try { return localStorage.getItem('VEO_FLOW_HEADER') || 'Authorization'; } catch { return 'Authorization'; } });
+  const [veoHeaderPrefix, setVeoHeaderPrefix] = useState<string>(() => { try { return localStorage.getItem('VEO_FLOW_PREFIX') || 'Bearer '; } catch { return 'Bearer '; } });
+  const [veoCookieName, setVeoCookieName] = useState<string>(() => { try { return localStorage.getItem('VEO_FLOW_COOKIE') || ''; } catch { return ''; } });
 
 
   // Modal states
@@ -149,6 +162,48 @@ const App: React.FC = () => {
         return () => unsubscribe();
     }, []);
 
+  const handleConnectFlow = async () => {
+    if (!(window as any).electronAPI || !openFlowAuth) {
+      addNotification('Flow auth is only available in the Electron app.', 'error');
+      return;
+    }
+    try {
+      addNotification('Opening Flow login window. Please sign in to your VEO Ultra account.', 'info');
+      const authUrl = 'https://labs.withgoogle.com/flow';
+      // Try some common key names — user can adjust if detection fails
+      const keyNames = ['veo_session', 'session', 'sessionKey', 'veo_token', 'authToken'];
+      const res = await openFlowAuth({ authUrl, keyNames, timeoutMs: 120000 });
+      if (res && res.success && res.session) {
+        localStorage.setItem('VEO_FLOW_SESSION', res.session);
+        setVeoSessionKey(res.session);
+        // preserve other settings if detected
+        if (res.key) {
+          // nothing to save here by default
+        }
+        addNotification('Flow session captured successfully.', 'success');
+        appLogger.add('INFO', 'Captured Flow session', { source: res.source, key: res.key });
+      } else {
+        console.warn('Flow auth result', res);
+        addNotification(`Failed to capture session: ${res?.message || 'unknown'}`, 'error');
+      }
+    } catch (err) {
+      console.error('Flow auth error', err);
+      addNotification('Error during Flow authentication. See console for details.', 'error');
+    }
+  };
+
+  const handleSaveVeoSettings = () => {
+    try {
+      localStorage.setItem('VEO_FLOW_BASE', veoApiBase || '');
+      localStorage.setItem('VEO_FLOW_HEADER', veoHeaderName || 'Authorization');
+      localStorage.setItem('VEO_FLOW_PREFIX', veoHeaderPrefix || 'Bearer ');
+      localStorage.setItem('VEO_FLOW_COOKIE', veoCookieName || '');
+      addNotification('VEO Flow settings saved.', 'success');
+    } catch (e) {
+      addNotification('Failed to save VEO Flow settings.', 'error');
+    }
+  };
+
   // --- NOTIFICATIONS ---
   const addNotification = useCallback((message: string, type: 'error' | 'success' | 'info') => {
     const id = Date.now();
@@ -157,6 +212,119 @@ const App: React.FC = () => {
       setNotifications(prev => prev.filter(n => n.id !== id));
     }, 5000); // Auto-dismiss after 5 seconds
   }, []);
+  
+  const toggleSceneSelection = (sceneId: string) => {
+    setSelectedSceneIds(prev => {
+      const next = new Set(prev);
+      if (next.has(sceneId)) next.delete(sceneId);
+      else next.add(sceneId);
+      return next;
+    });
+  };
+
+  const handleMergeSelected = async () => {
+    if (selectedSceneIds.size === 0) {
+      addNotification('No scenes selected to merge.', 'info');
+      return;
+    }
+
+    const selectedScenes = scenes.filter(s => selectedSceneIds.has(s.id) && s.videoUrl);
+    if (selectedScenes.length === 0) {
+      addNotification('Selected scenes must have generated videos.', 'error');
+      return;
+    }
+
+    if ((window as any).electronAPI && (window as any).electronAPI.mergeBuffers) {
+      try {
+        const { canceled, filePath } = await showSaveDialog({ title: 'Save merged video', defaultPath: 'merged_video.mp4' });
+        if (canceled || !filePath) return;
+
+        // If all selected scenes already have local paths, use merge by file path (faster)
+        const allHaveLocal = selectedScenes.every(s => (s as any).localPath);
+        setIsCombining(true);
+        addNotification('Merging selected scenes...', 'info');
+
+        if (allHaveLocal) {
+          try {
+            const inputPaths = selectedScenes.map(s => (s as any).localPath as string);
+            const unsubscribe = (window as any).electronAPI.onMergeLog((chunk: string) => {
+              setMergeLogs(prev => prev + chunk);
+            });
+            const result = await (window as any).electronAPI.mergeVideos(inputPaths, filePath);
+            unsubscribe && typeof unsubscribe === 'function' && unsubscribe();
+            if (result && result.success) {
+              addNotification('Merged video saved to disk.', 'success');
+              appLogger.add('INFO', 'Merge successful', { output: result.output });
+            } else {
+              console.error('Merge failed', result);
+              addNotification('Merge failed. See logs for details.', 'error');
+              appLogger.add('ERROR', 'Merge failed', { result });
+            }
+          } catch (err) {
+            console.error('Merge by path failed, falling back to buffer merge', err);
+            // Fall back to buffer-based merging below
+          }
+        }
+
+        // If not all scenes have localPath, or path-merge failed, fall back to sending buffers
+        if (!allHaveLocal) {
+          const unsubscribe = (window as any).electronAPI.onMergeLog((chunk: string) => {
+            setMergeLogs(prev => prev + chunk);
+          });
+
+          const files: { name?: string; data: string }[] = [];
+          for (let i = 0; i < selectedScenes.length; i++) {
+            const s = selectedScenes[i];
+            const url = s.videoUrl!;
+            const buffer = await fetch(url).then(r => r.arrayBuffer());
+            const bytes = new Uint8Array(buffer);
+            let binary = '';
+            const chunkSize = 0x8000;
+            for (let j = 0; j < bytes.length; j += chunkSize) {
+              binary += String.fromCharCode.apply(null, Array.from(bytes.subarray(j, j + chunkSize)));
+            }
+            const base64 = btoa(binary);
+            files.push({ name: `scene_${i + 1}.mp4`, data: base64 });
+          }
+
+          const result = await mergeBuffers(files, filePath);
+          unsubscribe && typeof unsubscribe === 'function' && unsubscribe();
+
+          if (result && result.success) {
+            addNotification('Merged video saved to disk.', 'success');
+            appLogger.add('INFO', 'Merge successful', { output: result.output });
+          } else {
+            console.error('Merge failed', result);
+            addNotification('Merge failed. See logs for details.', 'error');
+            appLogger.add('ERROR', 'Merge failed', { result });
+          }
+        }
+      } catch (error) {
+        handleApiError(error, 'merging selected scenes');
+      } finally {
+        setIsCombining(false);
+      }
+    } else {
+      try {
+        setIsCombining(true);
+        addNotification('Combining selected scenes in browser...', 'info');
+        const videoUrls = selectedScenes.map(s => s.videoUrl!);
+        const combinedVideoUrl = await videoUtils.combineVideos(videoUrls);
+        const a = document.createElement('a');
+        a.href = combinedVideoUrl;
+        a.download = 'merged_video.mp4';
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        setTimeout(() => URL.revokeObjectURL(combinedVideoUrl), 100);
+        addNotification('Combined video downloaded successfully!', 'success');
+      } catch (error) {
+        handleApiError(error, 'combining selected scenes');
+      } finally {
+        setIsCombining(false);
+      }
+    }
+  };
 
   const dismissNotification = (id: number) => {
     setNotifications(prev => prev.filter(n => n.id !== id));
@@ -181,34 +349,32 @@ const App: React.FC = () => {
         setIsLoading(false);
       }
     };
+
+    // call the checker and close this effect
     checkApiKey();
-    
-    const savedElevenLabsKey = localStorage.getItem(ELEVENLABS_API_KEY_STORAGE);
-    if (savedElevenLabsKey) {
-        setElevenLabsApiKey(savedElevenLabsKey);
-    }
   }, []);
-  
-  useEffect(() => {
-    if (elevenLabsApiKey) {
-        const fetchVoices = async () => {
-            try {
-                const voices = await elevenLabsService.getVoices(elevenLabsApiKey);
-                setElevenLabsVoices(voices);
-                if (voices.length > 0) {
-                    setVideoSettings(prev => ({ ...prev, voiceId: prev.voiceId || voices[0].id }));
-                    addNotification(`${voices.length} ElevenLabs voices loaded successfully.`, 'success');
-                } else {
-                     addNotification(`API Key is valid, but no voices were found.`, 'info');
-                }
-            } catch (error) {
-                handleApiError(error, 'fetching ElevenLabs voices');
-                setElevenLabsVoices([]);
-            }
-        };
-        fetchVoices();
-    }
-  }, [elevenLabsApiKey, addNotification]); // Re-run when key changes
+
+    // --- API KEY and ERROR HANDLING ---
+    useEffect(() => {
+      const checkApiKey = () => {
+        try {
+          const stored = localStorage.getItem('GEMINI_API_KEY');
+          setApiKeySelected(!!stored);
+          setGeminiApiKey(stored || '');
+        } catch (e) {
+          setApiKeySelected(false);
+          setGeminiApiKey('');
+        } finally {
+          setIsLoading(false);
+        }
+      };
+
+      checkApiKey();
+      const savedElevenLabsKey = localStorage.getItem(ELEVENLABS_API_KEY_STORAGE);
+      if (savedElevenLabsKey) {
+          setElevenLabsApiKey(savedElevenLabsKey);
+      }
+    }, []);
 
   const handleApiError = useCallback((error: unknown, context: string) => {
     const errorMessage = (error as Error).message || 'An unknown error occurred.';
@@ -310,6 +476,13 @@ const App: React.FC = () => {
     }
 
     setCharacters(prev => prev.map(c => c.id === characterId ? { ...c, isGenerating: true } : c));
+    // Quick client-side safety check to avoid calling the image API with prompts likely to be blocked
+    const promptCheck = geminiService.isPromptAllowed(character.prompt || '');
+    if (!promptCheck.allowed) {
+      addNotification(`Prompt not allowed: ${promptCheck.reason}`, 'error');
+      setCharacters(prev => prev.map(c => c.id === characterId ? { ...c, isGenerating: false } : c));
+      return;
+    }
     const operation = character.image ? 'editing' : 'generating';
     appLogger.add('INFO', `Starting character image ${operation}`, { name: character.name, prompt: character.prompt });
     try {
@@ -628,7 +801,24 @@ const App: React.FC = () => {
 
         try {
             const operation = await geminiService.startVideoGeneration(sceneToGenerate.prompt, videoSettings.aspectRatio, videoSettings.quality, characters);
-            setScenes(prev => prev.map(s => s.id === sceneId ? { ...s, operation } : s));
+            if (operation && operation.__flow) {
+              // Flow returned a ready video URL; set it immediately
+              const uri = operation.response?.generatedVideos?.[0]?.video?.uri;
+              if (uri) {
+                setScenes(prev => prev.map(s => s.id === sceneId ? { ...s, videoUrl: uri, isGenerating: false, operation: undefined } : s));
+                addNotification(`Video for scene ${scenes.findIndex(s => s.id === sceneId) + 1} is ready (via Flow)!`, 'success');
+                appLogger.add('INFO', 'Scene video generation (Flow) complete', { sceneId });
+                setActiveGenerations(prev => {
+                  const newSet = new Set(prev);
+                  newSet.delete(sceneId);
+                  return newSet;
+                });
+              } else {
+                setScenes(prev => prev.map(s => s.id === sceneId ? { ...s, isGenerating: false } : s));
+              }
+            } else {
+              setScenes(prev => prev.map(s => s.id === sceneId ? { ...s, operation } : s));
+            }
         } catch (error) {
             handleApiError(error, 'starting video generation');
             setScenes(prev => prev.map(s => s.id === sceneId ? { ...s, isGenerating: false } : s));
@@ -686,10 +876,48 @@ const App: React.FC = () => {
                 setScenes(prev => prev.map(s => s.id === sceneId ? { ...s, operation: updatedOperation, generationProgress: progress } : s));
 
                 if (updatedOperation.done) {
-                    if (updatedOperation.response) {
+                        if (updatedOperation.response) {
                         const uri = updatedOperation.response.generatedVideos[0].video.uri;
                         const videoUrl = await geminiService.fetchVideoData(uri);
-                        setScenes(prev => prev.map(s => s.id === sceneId ? { ...s, videoUrl, isGenerating: false, operation: undefined } : s));
+
+                        // If running inside Electron, prompt user to save the generated video to disk
+                        if ((window as any).electronAPI && (window as any).electronAPI.saveBase64File && (window as any).electronAPI.showSaveDialog) {
+                          try {
+                            const sceneIndex = scenes.findIndex(s => s.id === sceneId);
+                            const defaultName = `scene_${String(sceneIndex + 1).padStart(2, '0')}.mp4`;
+                            const { canceled, filePath } = await showSaveDialog({ title: 'Save generated scene video', defaultPath: defaultName });
+                            if (!canceled && filePath) {
+                              // fetch blob and convert to base64
+                              const buffer = await fetch(videoUrl).then(r => r.arrayBuffer());
+                              const bytes = new Uint8Array(buffer);
+                              let binary = '';
+                              const chunkSize = 0x8000;
+                              for (let j = 0; j < bytes.length; j += chunkSize) {
+                                binary += String.fromCharCode.apply(null, Array.from(bytes.subarray(j, j + chunkSize)));
+                              }
+                              const base64 = btoa(binary);
+                              const res = await saveBase64File(base64, filePath);
+                              if (res && res.success) {
+                                // Use file:// URL for playback and store localPath
+                                const fileUrl = `file://${res.filePath}`;
+                                setScenes(prev => prev.map(s => s.id === sceneId ? { ...s, videoUrl: fileUrl, localPath: res.filePath, isGenerating: false, operation: undefined } : s));
+                              } else {
+                                // Failed to save; fallback to blob URL
+                                setScenes(prev => prev.map(s => s.id === sceneId ? { ...s, videoUrl, isGenerating: false, operation: undefined } : s));
+                              }
+                            } else {
+                              // User cancelled save; keep blob URL
+                              setScenes(prev => prev.map(s => s.id === sceneId ? { ...s, videoUrl, isGenerating: false, operation: undefined } : s));
+                            }
+                          } catch (err) {
+                            console.error('Error saving generated video:', err);
+                            setScenes(prev => prev.map(s => s.id === sceneId ? { ...s, videoUrl, isGenerating: false, operation: undefined } : s));
+                          }
+                        } else {
+                          // Not running in Electron; use blob URL for browser playback
+                          setScenes(prev => prev.map(s => s.id === sceneId ? { ...s, videoUrl, isGenerating: false, operation: undefined } : s));
+                        }
+
                         addNotification(`Video for scene ${scenes.findIndex(s => s.id === sceneId) + 1} is ready!`, 'success');
                         appLogger.add('INFO', 'Scene video generation complete', { sceneId });
                     } else if (updatedOperation.error) {
@@ -907,47 +1135,7 @@ ${scene.prompt.complete_prompt}
       return <div className="min-h-screen w-full flex items-center justify-center bg-gray-900"><Loader text="Initializing Application..." /></div>;
     }
   
-    if (!apiKeySelected) {
-      return (
-          <div className="min-h-screen w-full flex items-center justify-center bg-gray-900 text-white p-4">
-              <div className="text-center p-8 bg-gray-800 rounded-lg shadow-xl max-w-lg border border-gray-700">
-                  <KeyIcon className="w-16 h-16 mx-auto text-indigo-400 mb-4" />
-                  <h2 className="text-2xl font-bold mb-2">Google AI API Key Required</h2>
-                  <p className="text-gray-400 mb-6">
-                      This application uses Google's Veo model for video generation, which requires you to select your own Google AI API key. Your key is used to track usage and billing.
-                  </p>
-                  <button
-                      onClick={async () => {
-                          setIsOpeningKeySelector(true);
-                          try {
-                              await window.aistudio.openSelectKey();
-                              setApiKeySelected(true); // Assume success to avoid race conditions
-                          } catch (e) {
-                              console.error("Could not open API key selection:", e);
-                              addNotification("Could not open the API key selection dialog.", 'error');
-                          } finally {
-                            setIsOpeningKeySelector(false);
-                          }
-                      }}
-                      disabled={isOpeningKeySelector}
-                      className="bg-indigo-600 hover:bg-indigo-700 disabled:bg-indigo-800 disabled:cursor-wait text-white font-bold py-3 px-6 rounded-lg transition duration-200 flex items-center justify-center mx-auto text-lg w-64 min-h-[56px]"
-                  >
-                      {isOpeningKeySelector ? (
-                          <div className="animate-spin rounded-full h-6 w-6 border-b-2 border-white"></div>
-                      ) : (
-                          'Select Google AI API Key'
-                      )}
-                  </button>
-                  <p className="text-xs text-gray-500 mt-4">
-                      For more information on billing, please visit the{' '}
-                      <a href="https://ai.google.dev/gemini-api/docs/billing" target="_blank" rel="noopener noreferrer" className="underline hover:text-indigo-400">
-                          official documentation
-                      </a>.
-                  </p>
-              </div>
-          </div>
-      );
-    }
+    
     
     // FIX: Explicitly type `videoModelOptions` to allow for an optional `tooltip` property, resolving a TypeScript error.
     const videoModelOptions: {
@@ -977,6 +1165,59 @@ ${scene.prompt.complete_prompt}
         style={{ display: 'none' }}
         aria-hidden="true"
       />
+
+      <div className="mb-6 p-4 bg-gray-800 rounded-lg flex flex-col md:flex-row md:items-center md:justify-between gap-3">
+        {!apiKeySelected ? (
+          <div className="flex flex-col sm:flex-row items-start sm:items-center gap-2 w-full">
+            <input
+              value={geminiApiKey}
+              onChange={e => setGeminiApiKey(e.target.value)}
+              placeholder="Enter Gemini API Key"
+              className="flex-1 bg-gray-900 border border-gray-700 p-2 rounded text-white"
+            />
+            <div className="flex gap-2">
+              <button
+                onClick={async () => {
+                  if (!geminiApiKey || geminiApiKey.trim().length === 0) return;
+                  setIsValidatingKey(true);
+                  try {
+                    const res = await validateApiKey(geminiApiKey.trim());
+                    if (res.valid) {
+                      localStorage.setItem('GEMINI_API_KEY', geminiApiKey.trim());
+                      setApiKeySelected(true);
+                      addNotification('Gemini API key saved and validated.', 'success');
+                    } else {
+                      console.error('API key validation failed:', res.message);
+                      addNotification(`API key validation failed: ${res.message || 'Invalid key'}`, 'error');
+                    }
+                  } catch (e) {
+                    console.error('Validation error', e);
+                    addNotification('API key validation error. See console for details.', 'error');
+                  } finally {
+                    setIsValidatingKey(false);
+                  }
+                }}
+                disabled={!geminiApiKey || isValidatingKey}
+                className="bg-indigo-600 hover:bg-indigo-700 disabled:bg-indigo-900 disabled:cursor-not-allowed text-white font-bold py-2 px-4 rounded-md"
+              >
+                {isValidatingKey ? 'Validating...' : 'Save Key'}
+              </button>
+            </div>
+          </div>
+        ) : (
+          <div className="flex items-center justify-between w-full">
+            <div className="text-sm text-green-400">Gemini API Key saved.</div>
+            <div className="flex gap-2">
+              <button
+                onClick={() => { localStorage.removeItem('GEMINI_API_KEY'); setApiKeySelected(false); setGeminiApiKey(''); addNotification('Gemini API key removed.', 'info'); }}
+                className="bg-gray-600 hover:bg-gray-500 text-white font-bold py-2 px-4 rounded-md"
+              >
+                Remove Key
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
 
       {isPromptModalOpen && editingScene && (
         <div className="fixed inset-0 bg-black/70 z-50 flex items-center justify-center p-4" onClick={closePromptEditor}>
@@ -1051,6 +1292,28 @@ ${scene.prompt.complete_prompt}
                     )}
                     </select>
                 </div>
+                  <div>
+                    <label className="block text-sm font-medium text-gray-300 mb-2">VEO Ultra (Flow) Integration</label>
+                    <div className="flex gap-2 items-center">
+                      <button onClick={handleConnectFlow} className="bg-green-600 hover:bg-green-700 text-white font-bold py-2 px-4 rounded-md">Connect Flow</button>
+                      <div className="text-sm text-gray-300">
+                        {veoSessionKey ? <span>Session: <code className="text-xs">{veoSessionKey.slice(0,8)}...{veoSessionKey.slice(-6)}</code></span> : <span className="text-gray-500">Not connected</span>}
+                      </div>
+                    </div>
+                    <p className="text-xs text-gray-400 mt-2">Open the Flow login and sign in; the app will attempt to capture your session token for VEO Ultra. The token is stored locally.</p>
+                    <div className="mt-3 grid grid-cols-1 gap-2">
+                      <input value={veoSessionKey} onChange={(e)=>setVeoSessionKey(e.target.value)} placeholder="Paste session token here" className="p-2 bg-gray-700 border border-gray-600 rounded-md text-sm" />
+                      <div className="flex gap-2">
+                        <input value={veoApiBase} onChange={(e)=>setVeoApiBase(e.target.value)} placeholder="Flow API base (optional)" className="flex-1 p-2 bg-gray-700 border border-gray-600 rounded-md text-sm" />
+                        <button onClick={handleSaveVeoSettings} className="bg-indigo-600 hover:bg-indigo-700 text-white font-bold py-2 px-3 rounded-md">Save</button>
+                      </div>
+                      <div className="flex gap-2">
+                        <input value={veoHeaderName} onChange={(e)=>setVeoHeaderName(e.target.value)} placeholder="Auth header name (Authorization)" className="flex-1 p-2 bg-gray-700 border border-gray-600 rounded-md text-sm" />
+                        <input value={veoHeaderPrefix} onChange={(e)=>setVeoHeaderPrefix(e.target.value)} placeholder="Header prefix (Bearer )" className="w-40 p-2 bg-gray-700 border border-gray-600 rounded-md text-sm" />
+                      </div>
+                      <input value={veoCookieName} onChange={(e)=>setVeoCookieName(e.target.value)} placeholder="Cookie name (optional)" className="p-2 bg-gray-700 border border-gray-600 rounded-md text-sm" />
+                    </div>
+                  </div>
             </div>
             <div className="mt-6 pt-6 border-t border-gray-700 space-y-4">
                 <div>
@@ -1484,12 +1747,31 @@ ${scene.prompt.complete_prompt}
                             <DownloadIcon className="w-5 h-5" />
                             {isCombining ? 'Combining...' : 'Combine & Download'}
                         </button>
+                      <button
+                        onClick={handleMergeSelected}
+                        disabled={selectedSceneIds.size === 0 || isCombining}
+                        className="bg-indigo-600 hover:bg-indigo-700 disabled:bg-indigo-900 disabled:cursor-not-allowed text-white font-bold py-2 px-4 rounded-md transition duration-200 flex items-center gap-2"
+                      >
+                        <FilmIcon className="w-5 h-5" />
+                        {isCombining ? 'Merging...' : 'Merge Selected'}
+                      </button>
                     </div>
                  </div>
                 <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-6">
                     {scenes.map((scene, index) => (
                         <div key={scene.id} className="bg-gray-700 p-4 rounded-lg shadow-md flex flex-col transition-all duration-300 hover:shadow-indigo-500/20 hover:ring-1 hover:ring-indigo-500">
-                           <h3 className="text-lg font-bold mb-2 text-indigo-300 border-b border-gray-600 pb-2">Scene {index + 1} <span className="text-sm font-normal text-gray-400">({scene.prompt.timestamp_start} - ${scene.prompt.timestamp_end})</span></h3>
+                           <h3 className="text-lg font-bold mb-2 text-indigo-300 border-b border-gray-600 pb-2 flex items-center justify-between">
+                             <span>Scene {index + 1} <span className="text-sm font-normal text-gray-400">({scene.prompt.timestamp_start} - {scene.prompt.timestamp_end})</span></span>
+                             <label className="flex items-center gap-2 text-sm">
+                               <input
+                                 type="checkbox"
+                                 checked={selectedSceneIds.has(scene.id)}
+                                 onChange={() => toggleSceneSelection(scene.id)}
+                                 className="w-4 h-4"
+                               />
+                               <span className="text-gray-300">Select</span>
+                             </label>
+                           </h3>
                            
                             <div className="relative w-full aspect-video bg-gray-800 rounded-md mb-4 flex items-center justify-center">
                                 {scene.isGenerating ? (

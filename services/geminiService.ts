@@ -1,10 +1,55 @@
 import { GoogleGenAI, Type, GenerateContentResponse, Modality } from "@google/genai";
 import { Character, Scene, VideoSettings, FinalVideoMeta, VideoQuality, StoryConcept, AspectRatio, ScenePrompt, EvolvingAsset, VideoAnalysis, SceneCharacter, SceneBackground, SceneCamera, SceneFoley, SceneFX } from "../types";
 import { appLogger } from "../utils/logger";
+import * as flowService from './flowService';
 
-// NOTE: This service assumes process.env.API_KEY is available in the environment.
+// NOTE: This service will try to read the API key from localStorage (renderer)
+// falling back to process.env.API_KEY for environments where localStorage
+// isn't available (e.g., CI or certain server contexts).
+const resolveApiKey = () => {
+    try {
+        if (typeof window !== 'undefined' && window.localStorage) {
+            const k = window.localStorage.getItem('GEMINI_API_KEY');
+            if (k && k.trim().length > 0) return k.trim();
+        }
+    } catch (e) {
+        // ignore
+    }
+    return process.env.API_KEY;
+};
 
-const getGenAI = () => new GoogleGenAI({ apiKey: process.env.API_KEY });
+/**
+ * Quick client-side check for prompts that reference minors or other sensitive terms
+ * which may trigger safety filters in image models. This is intentionally conservative
+ * and meant to prevent repeated API calls that will be blocked.
+ */
+export const isPromptAllowed = (prompt: string): { allowed: boolean; reason?: string } => {
+    if (!prompt || prompt.trim().length === 0) return { allowed: false, reason: 'Empty prompt' };
+    const lowered = prompt.toLowerCase();
+    const minorTerms = ['child', 'children', 'kid', 'kids', 'minor', 'infant', 'toddler', 'baby', 'young child', 'underage'];
+    const sensitiveTerms = ['diaper', 'nudity', 'sexual', 'sex', 'porn', 'inappropriate'];
+    for (const t of minorTerms) {
+        if (lowered.includes(t)) return { allowed: false, reason: 'Prompt references minors or children which is disallowed.' };
+    }
+    for (const t of sensitiveTerms) {
+        if (lowered.includes(t)) return { allowed: false, reason: 'Prompt contains sensitive terms that may be blocked.' };
+    }
+    return { allowed: true };
+};
+
+const getGenAI = () => new GoogleGenAI({ apiKey: resolveApiKey() });
+
+export const validateApiKey = async (key: string): Promise<{ valid: boolean; message?: string }> => {
+    try {
+        if (!key || key.trim().length === 0) return { valid: false, message: 'Empty key' };
+        const ai = new GoogleGenAI({ apiKey: key });
+        // Make a very small request to validate the key. Use a cheap model and tiny output.
+        await ai.models.generateContent({ model: 'gemini-2.5-flash', contents: 'ping', config: { maxOutputTokens: 1 } as any });
+        return { valid: true };
+    } catch (err: any) {
+        return { valid: false, message: err?.message || String(err) };
+    }
+};
 
 export const analyzeYouTubeVideo = async (url: string): Promise<VideoAnalysis> => {
     const systemInstruction = `You are an expert YouTube video analyst. Your task is to analyze the video provided directly via a file URI and structure your findings as a JSON object.
@@ -213,6 +258,12 @@ export const enhanceCharacterPrompt = async (originalPrompt: string): Promise<st
 
 export const generateCharacter = async (prompt: string, videoStyle: string, name?: string): Promise<{ name: string; image: string }> => {
   try {
+        // Server-side defensive safety check (in addition to client-side check)
+        const promptCheck = isPromptAllowed(prompt || '');
+        if (!promptCheck.allowed) {
+            appLogger.add('API_RESPONSE', 'geminiService.generateCharacter PROMPT_BLOCKED', { reason: promptCheck.reason, promptSnippet: (prompt || '').slice(0,200) });
+            throw new Error(`Prompt blocked by safety checks: ${promptCheck.reason}`);
+        }
     appLogger.add('API_REQUEST', 'geminiService.generateCharacter', { modelImage: 'gemini-2.5-flash-image', modelName: 'gemini-2.5-flash', prompt, videoStyle, name });
     const ai = getGenAI();
     let finalName = name;
@@ -236,13 +287,33 @@ export const generateCharacter = async (prompt: string, videoStyle: string, name
       },
     });
 
-    for (const part of response.candidates[0].content.parts) {
-      if (part.inlineData) {
-        appLogger.add('API_RESPONSE', 'geminiService.generateCharacter SUCCESS', { name: finalName, imageReceived: true });
-        return { name: finalName!, image: part.inlineData.data };
-      }
-    }
-    throw new Error("Image data not found in API response.");
+        const candidate = response.candidates && response.candidates[0];
+        if (!candidate) {
+            appLogger.add('API_RESPONSE', 'geminiService.generateCharacter FAILED', { response });
+            throw new Error('No candidates returned from image generation API. Response logged.');
+        }
+        if (candidate.finishReason === 'SAFETY') {
+            appLogger.add('API_RESPONSE', 'geminiService.generateCharacter SAFETY_BLOCK', { response });
+            throw new Error('Image generation blocked by safety filters.');
+        }
+        if (!candidate.content) {
+            appLogger.add('API_RESPONSE', 'geminiService.generateCharacter FAILED_NO_CONTENT', { candidate });
+            throw new Error('Image generation candidate missing content object. Response logged for debugging.');
+        }
+        const parts = candidate.content.parts;
+        if (!parts || !Array.isArray(parts) || parts.length === 0) {
+            appLogger.add('API_RESPONSE', 'geminiService.generateCharacter FAILED_NO_PARTS', { candidate });
+            throw new Error('Image generation response missing content parts. Response logged for debugging.');
+        }
+
+        for (const part of parts) {
+            if (part?.inlineData) {
+                appLogger.add('API_RESPONSE', 'geminiService.generateCharacter SUCCESS', { name: finalName, imageReceived: true });
+                return { name: finalName!, image: part.inlineData.data };
+            }
+        }
+        appLogger.add('API_RESPONSE', 'geminiService.generateCharacter FAILED_NO_INLINE', { candidate });
+        throw new Error('Image data not found in API response (no inlineData in parts).');
   } catch (error) {
     console.error("Error generating character:", error);
     throw error;
@@ -251,6 +322,12 @@ export const generateCharacter = async (prompt: string, videoStyle: string, name
 
 export const editCharacterImage = async (base64Image: string, prompt: string, mimeType: string = 'image/png'): Promise<string> => {
   try {
+        // Server-side defensive safety check
+        const promptCheck = isPromptAllowed(prompt || '');
+        if (!promptCheck.allowed) {
+            appLogger.add('API_RESPONSE', 'geminiService.editCharacterImage PROMPT_BLOCKED', { reason: promptCheck.reason, promptSnippet: (prompt || '').slice(0,200) });
+            throw new Error(`Prompt blocked by safety checks: ${promptCheck.reason}`);
+        }
     appLogger.add('API_REQUEST', 'geminiService.editCharacterImage', { model: 'gemini-2.5-flash-image', prompt });
     const ai = getGenAI();
     const editPrompt = `Refine the character in the provided image based on the following description. Maintain the existing art style, character pose, and solid white background. Only change the features mentioned in the description. Description: "${prompt}"`;
@@ -275,13 +352,33 @@ export const editCharacterImage = async (base64Image: string, prompt: string, mi
       },
     });
 
-    for (const part of response.candidates[0].content.parts) {
-      if (part.inlineData) {
-        appLogger.add('API_RESPONSE', 'geminiService.editCharacterImage SUCCESS', { imageReceived: true });
-        return part.inlineData.data;
-      }
-    }
-    throw new Error("Edited image data not found in API response.");
+        const candidate = response.candidates && response.candidates[0];
+        if (!candidate) {
+            appLogger.add('API_RESPONSE', 'geminiService.editCharacterImage FAILED', { response });
+            throw new Error('No candidates returned from image edit API. Response logged.');
+        }
+        if (candidate.finishReason === 'SAFETY') {
+            appLogger.add('API_RESPONSE', 'geminiService.editCharacterImage SAFETY_BLOCK', { response });
+            throw new Error('Image edit blocked by safety filters.');
+        }
+        if (!candidate.content) {
+            appLogger.add('API_RESPONSE', 'geminiService.editCharacterImage FAILED_NO_CONTENT', { candidate });
+            throw new Error('Edited image candidate missing content object. Response logged.');
+        }
+        const parts = candidate.content.parts;
+        if (!parts || !Array.isArray(parts) || parts.length === 0) {
+            appLogger.add('API_RESPONSE', 'geminiService.editCharacterImage FAILED_NO_PARTS', { candidate });
+            throw new Error('Edited image response missing content parts. Response logged.');
+        }
+
+        for (const part of parts) {
+            if (part?.inlineData) {
+                appLogger.add('API_RESPONSE', 'geminiService.editCharacterImage SUCCESS', { imageReceived: true });
+                return part.inlineData.data;
+            }
+        }
+        appLogger.add('API_RESPONSE', 'geminiService.editCharacterImage FAILED_NO_INLINE', { candidate });
+        throw new Error('Edited image data not found in API response (no inlineData in parts).');
   } catch (error) {
     console.error("Error editing character image:", error);
     throw error;
@@ -675,13 +772,28 @@ export const generateScenePreview = async (prompt: ScenePrompt, allCharacters: C
             },
         });
 
-        for (const part of response.candidates[0].content.parts) {
-            if (part.inlineData) {
+        const candidate = response.candidates?.[0];
+        if (!candidate) {
+            appLogger.add('API_RESPONSE', 'geminiService.generateScenePreview FAILED', { response });
+            throw new Error('No candidates returned from scene preview image API. Response logged.');
+        }
+        if (candidate.finishReason === 'SAFETY') {
+            appLogger.add('API_RESPONSE', 'geminiService.generateScenePreview SAFETY_BLOCK', { response });
+            throw new Error('Scene preview generation blocked by safety filters.');
+        }
+        const partsOut = candidate.content?.parts;
+        if (!partsOut || !Array.isArray(partsOut) || partsOut.length === 0) {
+            appLogger.add('API_RESPONSE', 'geminiService.generateScenePreview FAILED_NO_PARTS', { candidate });
+            throw new Error('Scene preview response missing content parts. Response logged.');
+        }
+        for (const part of partsOut) {
+            if (part?.inlineData) {
                 appLogger.add('API_RESPONSE', 'geminiService.generateScenePreview SUCCESS', { sceneId: prompt.scene_id, imageReceived: true });
                 return part.inlineData.data;
             }
         }
-        throw new Error("Image data not found for scene preview.");
+        appLogger.add('API_RESPONSE', 'geminiService.generateScenePreview FAILED_NO_INLINE', { candidate });
+        throw new Error('Image data not found for scene preview (no inlineData in parts).');
     } catch (error) {
         console.error("Error generating scene preview:", error);
         throw error;
@@ -778,6 +890,32 @@ const synthesizeVideoPrompt = (prompt: ScenePrompt): string => {
 
 export const startVideoGeneration = async (prompt: ScenePrompt, aspectRatio: AspectRatio, quality: VideoQuality, allCharacters: Character[]): Promise<any> => {
     try {
+        // If the user has a VEO Flow session configured, prefer using Flow for generation
+        try {
+            let flowSession = null;
+            if (typeof window !== 'undefined' && window.localStorage) {
+                flowSession = window.localStorage.getItem('VEO_FLOW_SESSION');
+            }
+            const flowBase = (typeof window !== 'undefined' && window.localStorage) ? window.localStorage.getItem('VEO_FLOW_BASE') : null;
+            if (flowSession) {
+                const flowRes = await flowService.generateVideoFromFlow(prompt.complete_prompt || prompt.visual_style || '', {
+                    sessionKey: flowSession,
+                    baseUrl: flowBase || undefined,
+                    headerName: (typeof window !== 'undefined' && window.localStorage?.getItem('VEO_FLOW_HEADER')) || 'Authorization',
+                    headerPrefix: (typeof window !== 'undefined' && window.localStorage?.getItem('VEO_FLOW_PREFIX')) || 'Bearer ',
+                    cookieName: (typeof window !== 'undefined' && window.localStorage?.getItem('VEO_FLOW_COOKIE')) || undefined,
+                    timeoutMs: 2 * 60 * 1000,
+                });
+                if (flowRes.success && flowRes.url) {
+                    // Return an operation-like object that the renderer can handle specially
+                    return { __flow: true, done: true, response: { generatedVideos: [{ video: { uri: flowRes.url } }] } };
+                } else {
+                    appLogger.add('ERROR', 'flowService.generateVideoFromFlow failed', { message: flowRes.message });
+                }
+            }
+        } catch (e) {
+            appLogger.add('ERROR', 'flowService invocation error', { error: String(e) });
+        }
         const ai = getGenAI();
         
         const config: any = {
@@ -854,11 +992,12 @@ export const checkVideoOperationStatus = async (operation: any): Promise<any> =>
 
 export const fetchVideoData = async (uri: string): Promise<string> => {
     try {
-        if (!process.env.API_KEY) {
-            throw new Error("API_KEY environment variable not set.");
+        const apiKey = resolveApiKey();
+        if (!apiKey) {
+            throw new Error("API key not provided. Please set GEMINI_API_KEY in localStorage or provide process.env.API_KEY.");
         }
         appLogger.add('API_REQUEST', 'geminiService.fetchVideoData', { uri: uri.split('&key=')[0] });
-        const response = await fetch(`${uri}&key=${process.env.API_KEY}`);
+        const response = await fetch(`${uri}&key=${apiKey}`);
         if (!response.ok) {
             const errorText = await response.text();
             throw new Error(`Failed to fetch video data: ${response.status} ${response.statusText} - ${errorText}`);

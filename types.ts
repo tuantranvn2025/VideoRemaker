@@ -111,6 +111,7 @@ export interface Scene {
   imageSequence?: string[];
   audioUrl?: string;
   isGeneratingAudio?: boolean;
+  localPath?: string; // absolute local filesystem path when running in Electron
 }
 
 export interface StoryConcept {
